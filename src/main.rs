@@ -1,14 +1,18 @@
+use std::time::{Duration, Instant};
 use color_eyre::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::{buffer::Buffer, layout::{Constraint, Flex, Layout, Rect}, style::{Color, Styled, Stylize}, text::{Line, Span, Text}, widgets::{Block, Paragraph, Widget, Wrap}, DefaultTerminal, Frame};
+use ratatui::{buffer::Buffer, layout::{Constraint, Flex, Layout, Rect}, style::{Color, Styled, Stylize}, text::{Line, Span, Text}, widgets::{Block, List, ListState, Paragraph, StatefulWidget, Widget, Wrap}, DefaultTerminal, Frame};
 
-#[derive(PartialEq)]
+const LIST_NEXT: Duration = Duration::from_millis(100);
+const READ_BLOCK: Duration = Duration::from_millis(50);
+
+#[derive(PartialEq, Clone, Copy)]
 enum EndState {
     Left,
     Right
 }
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Clone, Copy)]
 enum RatState {
     Start,
     Mid,
@@ -18,6 +22,10 @@ enum RatState {
 struct Rat {
     value: i32,
     state: RatState,
+    list: Vec<RatState>,
+    list_state: ListState, 
+    sublist_state: ListState,
+    last_tick: Instant,
     quit: bool
 }
 
@@ -26,6 +34,14 @@ impl Rat {
         Rat {
             value: 0,
             state: RatState::Start,
+            list: vec![
+                RatState::Start,
+                RatState::Mid,
+                RatState::End(EndState::Left),
+            ],
+            list_state: ListState::default().with_selected(Some(0)),
+            sublist_state: ListState::default().with_selected(Some(0)),
+            last_tick: Instant::now(),
             quit: false
         }
     }
@@ -33,12 +49,12 @@ impl Rat {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
             terminal.draw(|f| self.draw(f))?;
-            self.handle_key()?;
+            if event::poll(READ_BLOCK)? { self.handle_key()?; }
         }
         Ok(())
     }
 
-    fn draw(&self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame) {
         frame.render_widget(self, frame.area());
     }
 
@@ -47,21 +63,18 @@ impl Rat {
             match kv.code {
                 KeyCode::Esc => { self.quit = true; }
                 KeyCode::Right => {
-                    match self.state {
-                        RatState::Start => self.state = RatState::Mid,
-                        RatState::Mid => self.state = RatState::End(EndState::Left),
-                        RatState::End(_) => self.state = RatState::Start,
-                    }
+                    self.list_state.select_next();
+                    if self.list_state.selected().unwrap_or_default() >= self.list.len() { self.list_state.select(Some(0)); }
+                    self.state = self.list[self.list_state.selected().unwrap_or_default()];
                 }
                 KeyCode::Left => {
-                    match self.state {
-                        RatState::Start => self.state = RatState::End(EndState::Left),
-                        RatState::Mid => self.state = RatState::Start,
-                        RatState::End(_) => self.state = RatState::Mid,
-                    }
+                    if self.list_state.selected().unwrap_or_default() == 0 { self.list_state.select(Some(self.list.len() - 1)); } 
+                    else { self.list_state.select_previous(); }
+                    self.state = self.list[self.list_state.selected().unwrap_or_default()];
                 }
                 KeyCode::Up if self.state == RatState::Mid => self.value += 1,
                 KeyCode::Down if self.state == RatState::Mid => self.value -= 1,
+
                 KeyCode::Tab if self.state == RatState::End(EndState::Right) || self.state == RatState::End(EndState::Left) => {
                     if let RatState::End(EndState::Left) = self.state { self.state = RatState::End(EndState::Right); }
                     else {  self.state = RatState::End(EndState::Left); }
@@ -89,7 +102,7 @@ impl Rat {
         area
     }
 
-    fn render_start(&self, area: Rect, buf: &mut Buffer) {
+    fn render_start(&mut self, area: Rect, buf: &mut Buffer) {
         Block::bordered()
             .title("This is the start!".blue())
             .title_bottom("Press left/right to advance screen".italic().red().into_right_aligned_line())
@@ -98,14 +111,31 @@ impl Rat {
 
         let middle_text = Text::from(vec![
             Line::from("Hello my friend".bold().yellow().into_centered_line()),
-            Line::from("Press Esc to quit/escape".italic().white()),
+            Line::from("Press Esc to quit/escape".italic().white().into_centered_line()),
+            Line::from("Also here is a random list for no reason at all!".italic().magenta()),
         ]);
         let center_rect = Rat::render_center(
             area,
             Some(Constraint::Length(middle_text.width() as u16)),
             Some(Constraint::Length(middle_text.height() as u16))
         );
+
+        let mut list_rect = Rat::render_center(area, Some(Constraint::Length(6)), Some(Constraint::Length(10)));
+        list_rect = Layout::vertical([Constraint::Percentage(65), Constraint::Percentage(35)]).split(list_rect)[1];
+        let list = List::new(vec![
+            Line::from("Start").centered(),
+            Line::from("Mid").centered(),
+            Line::from("End").centered()
+        ]).magenta().highlight_symbol("-").highlight_style(Color::Green);
+
+        if self.last_tick.elapsed() >= LIST_NEXT {
+            if self.sublist_state.selected().unwrap_or_default() == list.len() - 1 { self.sublist_state.select(Some(0)); }
+            else { self.sublist_state.select_next(); }
+            self.last_tick = Instant::now();
+        }
+
         middle_text.render(center_rect, buf);
+        StatefulWidget::render(list, list_rect, buf, &mut self.sublist_state);
     }
 
     fn render_mid(&self, area: Rect, buf: &mut Buffer) {
@@ -186,12 +216,12 @@ impl Rat {
     }
 }
 
-impl Widget for &Rat {
+impl Widget for &mut Rat {
     fn render(self, area: Rect, buf: &mut Buffer) {
         match self.state {
             RatState::Start => self.render_start(area, buf),
             RatState::Mid => self.render_mid(area, buf),
-            RatState::End(_) => self.render_end(area, buf),
+            RatState::End(_) => self.render_end(area, buf)
         }
     }
 }
